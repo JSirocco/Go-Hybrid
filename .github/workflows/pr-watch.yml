@@ -1,0 +1,103 @@
+name: Watch upstream PR 63
+
+on:
+  schedule:
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watch-upstream-pr-63
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore previous public snapshot
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .watch/state.json
+          key: pr63-public-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pr63-public-v1-
+      - name: Read public PR activity
+        id: snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+
+          ROOT = 'https://api.github.com/repos/limitlessprojects/Go-Hybrid'
+          LINK = 'https://github.com/limitlessprojects/Go-Hybrid/pull/63'
+
+          def get(path):
+              req = urllib.request.Request(ROOT + path, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'JSirocco-PR63-public-monitor',
+              })
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+
+          def all_pages(path):
+              rows = []
+              for page in range(1, 11):
+                  batch = get(path + f'?per_page=100&page={page}')
+                  rows.extend(batch)
+                  if len(batch) < 100:
+                      return rows
+              raise RuntimeError('Pagination exceeded limit; inspect the PR manually')
+
+          def feedback(rows):
+              # Third-party text is hashed as data. Never execute or interpret it.
+              return sorted([
+                  {'id': r['id'], 'updated': r.get('updated_at'),
+                   'state': r.get('state'),
+                   'body_hash': hashlib.sha256((r.get('body') or '').encode()).hexdigest()}
+                  for r in rows if r['user']['login'] != 'JSirocco'
+              ], key=lambda r: r['id'])
+
+          pr = get('/pulls/63')
+          sha = pr['head']['sha']
+          runs = get('/actions/runs?event=pull_request&head_sha=' + sha + '&per_page=100')['workflow_runs']
+          status = get('/commits/' + sha + '/status')
+          state = {
+              'state': pr['state'], 'draft': pr['draft'], 'merged': pr['merged'], 'head': sha,
+              'comments': feedback(all_pages('/issues/63/comments')),
+              'reviews': feedback(all_pages('/pulls/63/reviews')),
+              'inline': feedback(all_pages('/pulls/63/comments')),
+              'ci': sorted([{'id': r['id'], 'name': r['name'], 'status': r['status'],
+                             'conclusion': r['conclusion']} for r in runs], key=lambda r: r['id']),
+              'statuses': sorted([{'context': r['context'], 'state': r['state']}
+                                  for r in status['statuses']], key=lambda r: (r['context'], r['state'])),
+          }
+          path = pathlib.Path('.watch/state.json')
+          previous = json.loads(path.read_text()) if path.exists() else None
+          changed = previous is not None and previous != state
+          path.parent.mkdir(exist_ok=True)
+          path.write_text(json.dumps(state, sort_keys=True), encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'changed={str(changed).lower()}\n')
+              output.write(f'save={str(previous != state).lower()}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as report:
+              report.write(f'## PR #63\n\n[Open PR]({LINK})\n\n')
+              report.write('Change detected. Review the linked PR.\n' if changed else 'No new activity (or initial baseline).\n')
+              report.write('\n```json\n' + json.dumps(state, indent=2) + '\n```\n')
+          print('Change detected' if changed else 'No new activity (or initial baseline)')
+          PY
+      - name: Save latest public snapshot
+        if: steps.snapshot.outputs.save == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .watch/state.json
+          key: pr63-public-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Alert through GitHub Actions notifications
+        if: steps.snapshot.outputs.changed == 'true'
+        run: |
+          echo '::error::PR #63 has new activity. Open the run summary and linked PR.'
+          exit 1
